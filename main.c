@@ -17,11 +17,25 @@ SemaphoreHandle_t xMutexUsuarios;
 SemaphoreHandle_t xResetSem;
 SemaphoreHandle_t xSemaphoreContagem;
 
-// ===== ISR SIMPLIFICADA =====
+// Variáveis para debounce da interrupção
+volatile uint32_t last_interrupt_time = 0;
+const uint32_t debounce_delay_ms = 200; // 200ms de debounce
+
+// ===== ISR COM DEBOUNCE =====
 void gpio_irq_handler(uint gpio, uint32_t events) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(xResetSem, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    
+    // Verifica se passou tempo suficiente desde a última interrupção
+    if ((current_time - last_interrupt_time) > debounce_delay_ms) {
+        // Atualiza timestamp da última interrupção válida
+        last_interrupt_time = current_time;
+        
+        // Processa a interrupção
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(xResetSem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+    // Se não passou tempo suficiente, ignora a interrupção (bounce)
 }
 
 // ===== TASK BOTÃO A - ENTRADA =====
@@ -130,7 +144,7 @@ int main() {
     gpio_set_dir(BOTAO_B_GPIO, GPIO_IN);
     gpio_pull_up(BOTAO_B_GPIO);
     
-    // Joystick com interrupção
+    // Joystick com interrupção e debounce
     gpio_init(JOYSTICK_GPIO);
     gpio_set_dir(JOYSTICK_GPIO, GPIO_IN);
     gpio_pull_up(JOYSTICK_GPIO);
