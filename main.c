@@ -8,11 +8,21 @@
 // ===== DEFINIÇÕES =====
 #define BOTAO_A_GPIO 5      
 #define BOTAO_B_GPIO 6      
-#define MAX_USUARIOS 10
+#define JOYSTICK_GPIO 22    
+#define MAX_USUARIOS 8      
 
 // ===== VARIÁVEIS GLOBAIS =====
 volatile int usuarios_ativos = 0;
 SemaphoreHandle_t xMutexUsuarios;
+SemaphoreHandle_t xResetSem;
+SemaphoreHandle_t xSemaphoreContagem;
+
+// ===== ISR SIMPLIFICADA =====
+void gpio_irq_handler(uint gpio, uint32_t events) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(xResetSem, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
 
 // ===== TASK BOTÃO A - ENTRADA =====
 void vTaskEntrada(void *pvParameters) {
@@ -26,16 +36,16 @@ void vTaskEntrada(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(50));
             
             if (!gpio_get(BOTAO_A_GPIO)) {
-                xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-                
-                if (usuarios_ativos < MAX_USUARIOS) {
+                // Tenta adquirir permissão do semáforo de contagem
+                if (xSemaphoreTake(xSemaphoreContagem, 0) == pdTRUE) {
+                    xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
                     usuarios_ativos++;
                     printf("[ENTRADA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
+                    xSemaphoreGive(xMutexUsuarios);
                 } else {
-                    printf("[ENTRADA] LIMITE! %d/%d - BEEP\n", usuarios_ativos, MAX_USUARIOS);
+                    // Sistema cheio - emite beep
+                    printf("[ENTRADA] LIMITE! %d/%d - BEEP\n", MAX_USUARIOS, MAX_USUARIOS);
                 }
-                
-                xSemaphoreGive(xMutexUsuarios);
                 
                 while (!gpio_get(BOTAO_A_GPIO)) {
                     vTaskDelay(pdMS_TO_TICKS(10));
@@ -64,6 +74,8 @@ void vTaskSaida(void *pvParameters) {
                 
                 if (usuarios_ativos > 0) {
                     usuarios_ativos--;
+                    // Libera uma vaga no semáforo de contagem
+                    xSemaphoreGive(xSemaphoreContagem);
                     printf("[SAIDA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
                 } else {
                     printf("[SAIDA] Nenhum usuario ativo\n");
@@ -82,25 +94,57 @@ void vTaskSaida(void *pvParameters) {
     }
 }
 
+// ===== TASK RESET - JOYSTICK COM INTERRUPÇÃO =====
+void vTaskReset(void *pvParameters) {
+    while (1) {
+        // Tarefa bloqueada até que o semáforo seja liberado na ISR
+        if (xSemaphoreTake(xResetSem, portMAX_DELAY) == pdTRUE) {
+            xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
+            
+            // Restaura todas as vagas no semáforo de contagem
+            int vagas_ocupadas = usuarios_ativos;
+            for (int i = 0; i < vagas_ocupadas; i++) {
+                xSemaphoreGive(xSemaphoreContagem);
+            }
+            
+            usuarios_ativos = 0;
+            printf("[RESET] Sistema resetado! Total: %d/%d - BEEP DUPLO\n", usuarios_ativos, MAX_USUARIOS);
+            
+            xSemaphoreGive(xMutexUsuarios);
+        }
+    }
+}
+
 // ===== FUNÇÃO PRINCIPAL =====
 int main() {
     stdio_init_all();
     
     // ===== CONFIGURAÇÃO DOS PINOS =====
+    // Botão A
     gpio_init(BOTAO_A_GPIO);
     gpio_set_dir(BOTAO_A_GPIO, GPIO_IN);
     gpio_pull_up(BOTAO_A_GPIO);
     
+    // Botão B
     gpio_init(BOTAO_B_GPIO);
     gpio_set_dir(BOTAO_B_GPIO, GPIO_IN);
     gpio_pull_up(BOTAO_B_GPIO);
     
-    // ===== CRIAÇÃO DO MUTEX =====
+    // Joystick com interrupção
+    gpio_init(JOYSTICK_GPIO);
+    gpio_set_dir(JOYSTICK_GPIO, GPIO_IN);
+    gpio_pull_up(JOYSTICK_GPIO);
+    gpio_set_irq_enabled_with_callback(JOYSTICK_GPIO, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    
+    // ===== CRIAÇÃO DOS SEMÁFOROS =====
     xMutexUsuarios = xSemaphoreCreateMutex();
+    xResetSem = xSemaphoreCreateBinary();
+    xSemaphoreContagem = xSemaphoreCreateCounting(MAX_USUARIOS, MAX_USUARIOS);
     
     // ===== CRIAÇÃO DAS TASKS =====
     xTaskCreate(vTaskEntrada, "TaskEntrada", 1024, NULL, 2, NULL);
     xTaskCreate(vTaskSaida, "TaskSaida", 1024, NULL, 2, NULL);
+    xTaskCreate(vTaskReset, "TaskReset", 1024, NULL, 3, NULL);
     
     // ===== INICIA O SCHEDULER =====
     vTaskStartScheduler();
