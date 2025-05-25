@@ -22,12 +22,15 @@
 #define DISPLAY_HEIGHT 64
 
 // LEDs RGB
-#define LED_VERDE_GPIO 11   // GPIO 11 - Verde
-#define LED_AZUL_GPIO 12    // GPIO 12 - Azul  
-#define LED_VERMELHO_GPIO 13 // GPIO 13 - Vermelho
+#define LED_VERDE_GPIO 11   
+#define LED_AZUL_GPIO 12    
+#define LED_VERMELHO_GPIO 13 
 
 // ===== VARIÁVEIS GLOBAIS =====
 volatile int usuarios_ativos = 0;
+volatile int contador_resets = 0;  // Nova variável para contar resets
+volatile bool mostrar_resetado = false;  // Flag para mostrar "RESETADO!"
+
 SemaphoreHandle_t xMutexUsuarios;
 SemaphoreHandle_t xMutexDisplay;
 SemaphoreHandle_t xResetSem;
@@ -39,6 +42,23 @@ ssd1306_t display;
 // Variáveis para debounce da interrupção
 volatile uint32_t last_interrupt_time = 0;
 const uint32_t debounce_delay_ms = 200;
+
+// ===== FUNÇÃO PARA OBTER COR DO LED EM TEXTO =====
+const char* obter_cor_led() {
+    if (usuarios_ativos == 0) {
+        return "AZUL";
+    } 
+    else if (usuarios_ativos >= 1 && usuarios_ativos <= MAX_USUARIOS - 2) {
+        return "VERDE";
+    }
+    else if (usuarios_ativos == MAX_USUARIOS - 1) {
+        return "AMARELO";
+    }
+    else if (usuarios_ativos == MAX_USUARIOS) {
+        return "VERMELHO";
+    }
+    return "ERRO";
+}
 
 // ===== FUNÇÃO PARA CONTROLAR LED RGB =====
 void atualizar_led_rgb() {
@@ -57,8 +77,8 @@ void atualizar_led_rgb() {
     else if (usuarios_ativos == MAX_USUARIOS - 1) {
         // AMARELO - Apenas 1 vaga restante (MAX-1, ou seja, 9)
         gpio_put(LED_AZUL_GPIO, 0);
-        gpio_put(LED_VERDE_GPIO, 1);    // Verde ligado
-        gpio_put(LED_VERMELHO_GPIO, 1); // Vermelho ligado = AMARELO
+        gpio_put(LED_VERDE_GPIO, 1);    
+        gpio_put(LED_VERMELHO_GPIO, 1); 
     }
     else if (usuarios_ativos == MAX_USUARIOS) {
         // VERMELHO - Capacidade máxima (MAX, ou seja, 10)
@@ -68,30 +88,47 @@ void atualizar_led_rgb() {
     }
 }
 
-// ===== FUNÇÃO PARA ATUALIZAR DISPLAY SIMPLIFICADA =====
+// ===== FUNÇÃO PARA ATUALIZAR DISPLAY COMPLETA =====
 void atualizar_display() {
     if (xSemaphoreTake(xMutexDisplay, pdMS_TO_TICKS(100)) == pdTRUE) {
-        char linha1[32], linha2[32];
+        char linha1[32], linha2[32], linha3[32], linha4[32], linha5[32];
         
-        // Linha 1: Sempre mostra "Usuarios: x/10"
+        // Linha 1: Usuarios: x/10
         sprintf(linha1, "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
         
-        // Linha 2: Estado do sistema
+        // Linha 2: Estado (EM MAIÚSCULA)
         if (usuarios_ativos == 0) {
-            sprintf(linha2, "VAZIO");
+            sprintf(linha2, "Estado: VAZIO");
         } else if (usuarios_ativos == MAX_USUARIOS) {
-            sprintf(linha2, "LOTADO");
+            sprintf(linha2, "Estado: LOTADO");
         } else if (usuarios_ativos == MAX_USUARIOS - 1) {
-            sprintf(linha2, "QUASE CHEIO");
+            sprintf(linha2, "Estado: QUASE CHEIO");
         } else {
-            sprintf(linha2, "NORMAL");
+            sprintf(linha2, "Estado: NORMAL");
         }
         
-        ssd1306_fill(&display, false);
-        ssd1306_draw_string(&display, linha1, 5, 15, false);
-        ssd1306_draw_string(&display, linha2, 5, 35, false);
-        ssd1306_send_data(&display);
+        // Linha 3: Cor do LED
+        sprintf(linha3, "LED: %s", obter_cor_led());
         
+        // Linha 4: Quantidade de resets
+        sprintf(linha4, "Resets: %d", contador_resets);
+        
+        // Limpa display
+        ssd1306_fill(&display, false);
+        
+        // Desenha as 4 informações principais
+        ssd1306_draw_string(&display, linha1, 2, 2, false);   // Linha 1
+        ssd1306_draw_string(&display, linha2, 2, 14, false);  // Linha 2  
+        ssd1306_draw_string(&display, linha3, 2, 26, false);  // Linha 3
+        ssd1306_draw_string(&display, linha4, 2, 38, false);  // Linha 4
+        
+        // Linha 5: RESETADO! (se ativo)
+        if (mostrar_resetado) {
+            sprintf(linha5, "** RESETADO! **");
+            ssd1306_draw_string(&display, linha5, 15, 52, false); // Última linha, centralizado
+        }
+        
+        ssd1306_send_data(&display);
         xSemaphoreGive(xMutexDisplay);
     }
     
@@ -194,10 +231,24 @@ void vTaskReset(void *pvParameters) {
             }
             
             usuarios_ativos = 0;
-            printf("[RESET] Sistema resetado! Total: %d/%d - BEEP DUPLO\n", usuarios_ativos, MAX_USUARIOS);
+            contador_resets++;  // Incrementa contador de resets
             
+            printf("[RESET] Sistema resetado! Total: %d/%d - BEEP DUPLO (Reset #%d)\n", 
+                   usuarios_ativos, MAX_USUARIOS, contador_resets);
+            
+            // Ativa flag para mostrar "RESETADO!"
+            mostrar_resetado = true;
             atualizar_display();
             
+            xSemaphoreGive(xMutexUsuarios);
+            
+            // Mostra "RESETADO!" por 2 segundos
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            
+            // Remove mensagem "RESETADO!" e atualiza display novamente
+            xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
+            mostrar_resetado = false;
+            atualizar_display();
             xSemaphoreGive(xMutexUsuarios);
         }
     }
