@@ -21,6 +21,11 @@
 #define DISPLAY_WIDTH 128
 #define DISPLAY_HEIGHT 64
 
+// LEDs RGB
+#define LED_VERDE_GPIO 11   // GPIO 11 - Verde
+#define LED_AZUL_GPIO 12    // GPIO 12 - Azul  
+#define LED_VERMELHO_GPIO 13 // GPIO 13 - Vermelho
+
 // ===== VARIÁVEIS GLOBAIS =====
 volatile int usuarios_ativos = 0;
 SemaphoreHandle_t xMutexUsuarios;
@@ -34,6 +39,34 @@ ssd1306_t display;
 // Variáveis para debounce da interrupção
 volatile uint32_t last_interrupt_time = 0;
 const uint32_t debounce_delay_ms = 200;
+
+// ===== FUNÇÃO PARA CONTROLAR LED RGB =====
+void atualizar_led_rgb() {
+    if (usuarios_ativos == 0) {
+        // AZUL - Nenhum usuário logado
+        gpio_put(LED_AZUL_GPIO, 1);
+        gpio_put(LED_VERDE_GPIO, 0);
+        gpio_put(LED_VERMELHO_GPIO, 0);
+    } 
+    else if (usuarios_ativos >= 1 && usuarios_ativos <= MAX_USUARIOS - 2) {
+        // VERDE - Usuários ativos (de 1 a MAX-2, ou seja, 1 a 8)
+        gpio_put(LED_AZUL_GPIO, 0);
+        gpio_put(LED_VERDE_GPIO, 1);
+        gpio_put(LED_VERMELHO_GPIO, 0);
+    }
+    else if (usuarios_ativos == MAX_USUARIOS - 1) {
+        // AMARELO - Apenas 1 vaga restante (MAX-1, ou seja, 9)
+        gpio_put(LED_AZUL_GPIO, 0);
+        gpio_put(LED_VERDE_GPIO, 1);    // Verde ligado
+        gpio_put(LED_VERMELHO_GPIO, 1); // Vermelho ligado = AMARELO
+    }
+    else if (usuarios_ativos == MAX_USUARIOS) {
+        // VERMELHO - Capacidade máxima (MAX, ou seja, 10)
+        gpio_put(LED_AZUL_GPIO, 0);
+        gpio_put(LED_VERDE_GPIO, 0);
+        gpio_put(LED_VERMELHO_GPIO, 1);
+    }
+}
 
 // ===== FUNÇÃO PARA ATUALIZAR DISPLAY SIMPLIFICADA =====
 void atualizar_display() {
@@ -61,6 +94,9 @@ void atualizar_display() {
         
         xSemaphoreGive(xMutexDisplay);
     }
+    
+    // Atualiza LED RGB junto com o display
+    atualizar_led_rgb();
 }
 
 // ===== ISR COM DEBOUNCE =====
@@ -180,6 +216,19 @@ int main() {
     
     ssd1306_init(&display, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_ADDRESS, I2C_PORT);
     ssd1306_config(&display);
+    
+    // ===== CONFIGURAÇÃO DOS LEDS RGB =====
+    gpio_init(LED_VERDE_GPIO);
+    gpio_set_dir(LED_VERDE_GPIO, GPIO_OUT);
+    gpio_put(LED_VERDE_GPIO, 0);
+    
+    gpio_init(LED_AZUL_GPIO);
+    gpio_set_dir(LED_AZUL_GPIO, GPIO_OUT);
+    gpio_put(LED_AZUL_GPIO, 0);
+    
+    gpio_init(LED_VERMELHO_GPIO);
+    gpio_set_dir(LED_VERMELHO_GPIO, GPIO_OUT);
+    gpio_put(LED_VERMELHO_GPIO, 0);
     
     // ===== CONFIGURAÇÃO DOS PINOS =====
     gpio_init(BOTAO_A_GPIO);
