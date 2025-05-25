@@ -102,7 +102,7 @@ void atualizar_display() {
         } else if (usuarios_ativos == MAX_USUARIOS) {
             sprintf(linha2, "Estado: LOTADO");
         } else if (usuarios_ativos == MAX_USUARIOS - 1) {
-            sprintf(linha2, "Estado: QUASE CHEIO");
+            sprintf(linha2, "Estado: ENCHENDO");
         } else {
             sprintf(linha2, "Estado: NORMAL");
         }
