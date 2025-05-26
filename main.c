@@ -1,372 +1,374 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "FreeRTOS.h" 
+#include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "queue.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "lib/Display_Bibliotecas/ssd1306.h"
 #include "lib/Matriz_Bibliotecas/matriz_led.h"
 
-// ===== DEFINIÇÕES =====
-#define BOTAO_A_GPIO 5      
-#define BOTAO_B_GPIO 6      
-#define JOYSTICK_GPIO 22    
-#define MAX_USUARIOS 10     
+/* --------------------------------------------------------------------------- */
+/* 1. Mapeamento de hardware                                                   */
+/* --------------------------------------------------------------------------- */
+#define PINO_BTN_ENTRADA      5     // Botão A
+#define PINO_BTN_SAIDA        6     // Botão B
+#define PINO_JOYSTICK_RESET   22
+#define MAX_USUARIOS          10
 
-// Configurações I2C e Display
-#define I2C_PORT i2c1
-#define I2C_SDA 14
-#define I2C_SCL 15
-#define DISPLAY_ADDRESS 0x3C
-#define DISPLAY_WIDTH 128
-#define DISPLAY_HEIGHT 64
+/* Display OLED (SSD1306) */
+#define I2C_PORT              i2c1
+#define I2C_SDA               14
+#define I2C_SCL               15
+#define OLED_ENDERECO         0x3C
+#define OLED_LARGURA          128
+#define OLED_ALTURA           64
 
-// LEDs RGB
-#define LED_VERDE_GPIO 11   
-#define LED_AZUL_GPIO 12    
-#define LED_VERMELHO_GPIO 13 
+/* LED RGB (anodos separados) */
+#define PINO_LED_VERDE        11
+#define PINO_LED_AZUL         12
+#define PINO_LED_VERMELHO     13
 
-// ===== VARIÁVEIS GLOBAIS =====
-volatile int usuarios_ativos = 0;
-volatile int contador_resets = 0;
-volatile bool mostrar_resetado = false;
-volatile bool tela_atual_stats = true; 
+/* --------------------------------------------------------------------------- */
+/* 2. Tipos, enuns e tamanhos de filas                                         */
+/* --------------------------------------------------------------------------- */
+typedef enum {
+    CMD_ATUALIZAR_TELA,
+    CMD_MOSTRAR_MSG_RESET,
+    CMD_OCULTAR_MSG_RESET,
+    CMD_ALTERNAR_TELA
+} comando_display_t;
 
-SemaphoreHandle_t xMutexUsuarios;
-SemaphoreHandle_t xMutexDisplay;
-SemaphoreHandle_t xResetSem;
-SemaphoreHandle_t xSemaphoreContagem;
+#define TAM_FILA_DISPLAY      5
 
-// Display
-ssd1306_t display;
+/* --------------------------------------------------------------------------- */
+/* 3. Variáveis globais protegidas por mutex                                   */
+/* --------------------------------------------------------------------------- */
+volatile uint8_t usuarios_ativos       = 0;    // 0-10
+volatile uint32_t total_resets         = 0;
+volatile bool mostrar_msg_reset        = false;
+volatile bool tela_stats_ativa         = true; // true = Estatísticas, false = Avatares
 
-// Variáveis para debounce da interrupção
-volatile uint32_t last_interrupt_time = 0;
-const uint32_t debounce_delay_ms = 400;
+/* --------------------------------------------------------------------------- */
+/* 4. Handles de FreeRTOS (mutexes, semáforos, filas)                          */
+/* --------------------------------------------------------------------------- */
+static SemaphoreHandle_t mtx_usuarios;
+static SemaphoreHandle_t mtx_oled;
+static SemaphoreHandle_t sem_reset_irq;
+static SemaphoreHandle_t sem_vagas;        // counting semaphore
+static QueueHandle_t fila_display;
 
-// ===== FUNÇÃO PARA OBTER COR DA MATRIZ LED BASEADA NO NÚMERO =====
-uint32_t obter_cor_numero(int numero) {
-    const uint32_t cores_numeros[] = {
-        COR_AZUL,      
-        COR_VERDE,     
-        COR_LARANJA,   
-        COR_VIOLETA,   
-        COR_OURO,      
-        COR_PRATA,     
-        COR_MARROM,    
-        COR_BRANCO,    
-        COR_CINZA,     
-        COR_AMARELO    
+/* --------------------------------------------------------------------------- */
+/* 5. Instância do display SSD1306                                             */
+/* --------------------------------------------------------------------------- */
+static ssd1306_t oled;
+
+/* --------------------------------------------------------------------------- */
+/* 6. Prototipagem de funções utilitárias                                      */
+/* --------------------------------------------------------------------------- */
+static uint32_t cor_para_numero(uint8_t n);
+static const char* texto_cor_led(void);
+static void atualizar_led_rgb(void);
+static void atualizar_matriz(void);
+static void desenhar_tela(void);
+
+/* --------------------------------------------------------------------------- */
+/* 7. Funções utilitárias                                                      */
+/* --------------------------------------------------------------------------- */
+
+/* Devolve cor da matriz 5×5 para um algarismo (0-9). */
+static uint32_t cor_para_numero(uint8_t n)
+{
+    const uint32_t paleta[] = {
+        COR_AZUL,  COR_VERDE,  COR_LARANJA, COR_VIOLETA, COR_OURO,
+        COR_PRATA, COR_MARROM, COR_BRANCO,  COR_CINZA,   COR_AMARELO
     };
-    
-    if (numero >= 0 && numero <= 9) {
-        return cores_numeros[numero];
-    }
-    return COR_VERMELHO; 
+    return (n < 10) ? paleta[n] : COR_VERMELHO;
 }
 
-// ===== FUNÇÃO PARA ATUALIZAR MATRIZ LED =====
-void atualizar_matriz_led() {
-    if (usuarios_ativos == MAX_USUARIOS) {
-        matriz_draw_pattern(PAD_X, COR_VERMELHO);
-    } else {
-        uint32_t cor = obter_cor_numero(usuarios_ativos);
-        matriz_draw_number(usuarios_ativos, cor);
-    }
+/* Texto “AZUL / VERDE / …” mostrado no OLED. */
+static const char* texto_cor_led(void)
+{
+    if (usuarios_ativos == 0)               return "AZUL";
+    if (usuarios_ativos <= MAX_USUARIOS-2)  return "VERDE";
+    if (usuarios_ativos == MAX_USUARIOS-1)  return "AMARELO";
+    return "VERMELHO";
 }
 
-// ===== FUNÇÃO PARA OBTER COR DO LED EM TEXTO =====
-const char* obter_cor_led() {
-    if (usuarios_ativos == 0) {
-        return "AZUL";
-    } 
-    else if (usuarios_ativos >= 1 && usuarios_ativos <= MAX_USUARIOS - 2) {
-        return "VERDE";
-    }
-    else if (usuarios_ativos == MAX_USUARIOS - 1) {
-        return "AMARELO";
-    }
-    else if (usuarios_ativos == MAX_USUARIOS) {
-        return "VERMELHO";
-    }
-    return "ERRO";
+/* Atualiza o LED RGB conforme lotação. */
+static void atualizar_led_rgb(void)
+{
+    bool azul   = (usuarios_ativos == 0);
+    bool verde  = (usuarios_ativos > 0 && usuarios_ativos <= MAX_USUARIOS-1);
+    bool vermelho = (usuarios_ativos >= MAX_USUARIOS-1);
+
+    gpio_put(PINO_LED_AZUL,     azul);
+    gpio_put(PINO_LED_VERDE,    verde);
+    gpio_put(PINO_LED_VERMELHO, vermelho && (usuarios_ativos == MAX_USUARIOS));
 }
 
-// ===== FUNÇÃO PARA CONTROLAR LED RGB =====
-void atualizar_led_rgb() {
-    if (usuarios_ativos == 0) {
-        gpio_put(LED_AZUL_GPIO, 1);
-        gpio_put(LED_VERDE_GPIO, 0);
-        gpio_put(LED_VERMELHO_GPIO, 0);
-    } 
-    else if (usuarios_ativos >= 1 && usuarios_ativos <= MAX_USUARIOS - 2) {
-        gpio_put(LED_AZUL_GPIO, 0);
-        gpio_put(LED_VERDE_GPIO, 1);
-        gpio_put(LED_VERMELHO_GPIO, 0);
-    }
-    else if (usuarios_ativos == MAX_USUARIOS - 1) {
-        gpio_put(LED_AZUL_GPIO, 0);
-        gpio_put(LED_VERDE_GPIO, 1);    
-        gpio_put(LED_VERMELHO_GPIO, 1); 
-    }
-    else if (usuarios_ativos == MAX_USUARIOS) {
-        gpio_put(LED_AZUL_GPIO, 0);
-        gpio_put(LED_VERDE_GPIO, 0);
-        gpio_put(LED_VERMELHO_GPIO, 1);
-    }
+/* Exibe número ou “X” na matriz 5×5. */
+static void atualizar_matriz(void)
+{
+    if (usuarios_ativos == MAX_USUARIOS)
+        matriz_draw_pattern(PAD_X, COR_VERMELHO);     // cheio
+    else
+        matriz_draw_number(usuarios_ativos, cor_para_numero(usuarios_ativos));
 }
 
-// ===== FUNÇÃO PARA ATUALIZAR DISPLAY COMPLETA (AGORA DECIDE QUAL TELA MOSTRAR) =====
-void atualizar_display_principal() {
-    if (xSemaphoreTake(xMutexDisplay, pdMS_TO_TICKS(100)) == pdTRUE) {
-        ssd1306_fill(&display, false); 
+/* ---------------------------------------------------------------------------------- */
+/* 8. Rotina central de desenho (chamada sempre pela vDisplayTask, nunca nas ISR)      */
+/* ---------------------------------------------------------------------------------- */
+static void desenhar_tela(void)
+{
+    if (xSemaphoreTake(mtx_oled, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ssd1306_fill(&oled, false);   // limpa
 
-        if (tela_atual_stats) {
-            char linha1[32], linha2[32], linha3[32], linha4[32], linha5[32];
-            
-            sprintf(linha1, "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
-            
-            if (usuarios_ativos == 0) {
-                sprintf(linha2, "Estado: VAZIO");
-            } else if (usuarios_ativos == MAX_USUARIOS) {
-                sprintf(linha2, "Estado: LOTADO");
-            } else if (usuarios_ativos == MAX_USUARIOS - 1) {
-                sprintf(linha2, "Estado:ENCHENDO");
-            } else {
-                sprintf(linha2, "Estado: NORMAL");
-            }
-            
-            sprintf(linha3, "LED: %s", obter_cor_led());
-            sprintf(linha4, "Resets: %d", contador_resets);
-            
-            ssd1306_draw_string(&display, linha1, 2, 2, false);
-            ssd1306_draw_string(&display, linha2, 2, 14, false);  
-            ssd1306_draw_string(&display, linha3, 2, 26, false);
-            ssd1306_draw_string(&display, linha4, 2, 38, false);
-            
-            if (mostrar_resetado) {
-                sprintf(linha5, "** RESETADO! **");
-                ssd1306_draw_string(&display, linha5, 15, 52, false);
-            }
-        } else {
-            const int ICON_WIDTH = 12;
-            const int ICON_HEIGHT = 12;
-            const int SPACING = 8;
-            const int ICONS_PER_ROW = 5;
-            const int CONTENT_WIDTH_ROW = (ICONS_PER_ROW * ICON_WIDTH) + ((ICONS_PER_ROW > 1 ? ICONS_PER_ROW - 1 : 0) * SPACING);
-            const int MARGIN_X = (DISPLAY_WIDTH - CONTENT_WIDTH_ROW) / 2;
-            
-            const int Y_ROW1 = (DISPLAY_HEIGHT / 4) - (ICON_HEIGHT / 2);
-            const int Y_ROW2 = (DISPLAY_HEIGHT * 3 / 4) - (ICON_HEIGHT / 2);
+        if (tela_stats_ativa) {
+            /* -------- TELA 1 – Estatísticas -------------------------------------- */
+            char buf[4][32];
+            sprintf(buf[0], "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
 
-            int usuarios_para_desenhar = usuarios_ativos;
+            if      (usuarios_ativos == 0)                 sprintf(buf[1], "Estado: VAZIO");
+            else if (usuarios_ativos == MAX_USUARIOS)      sprintf(buf[1], "Estado: LOTADO");
+            else if (usuarios_ativos == MAX_USUARIOS-1)    sprintf(buf[1], "Estado: ENCHENDO");
+            else                                           sprintf(buf[1], "Estado: NORMAL");
 
-            for (int i = 0; i < usuarios_para_desenhar && i < MAX_USUARIOS; ++i) {
-                int x_pos, y_pos;
-                if (i < ICONS_PER_ROW) { 
-                    x_pos = MARGIN_X + (i * (ICON_WIDTH + SPACING));
-                    y_pos = Y_ROW1;
-                } else { 
-                    x_pos = MARGIN_X + ((i - ICONS_PER_ROW) * (ICON_WIDTH + SPACING));
-                    y_pos = Y_ROW2;
-                }
-                // Corrigido para usar ssd1306_rect com os parâmetros corretos
-                // top, left, width, height, value, fill
-                ssd1306_rect(&display, y_pos, x_pos, ICON_WIDTH, ICON_HEIGHT, true, true);
+            sprintf(buf[2], "LED: %s", texto_cor_led());
+            sprintf(buf[3], "Resets: %ld", total_resets);
+
+            for (uint8_t i = 0; i < 4; ++i)
+                ssd1306_draw_string(&oled, buf[i], 2, 2 + 12*i, false);
+
+            if (mostrar_msg_reset)
+                ssd1306_draw_string(&oled, "** RESETADO! **", 15, 52, false);
+        }
+        else {
+            /* -------- TELA 2 – Avatares ------------------------------------------ */
+            const uint8_t L = 12, ESP = 8, P_ROW = 5;
+            const uint8_t largura_linha = P_ROW*L + (P_ROW-1)*ESP;
+            const int margem_x = (OLED_LARGURA - largura_linha)/2;
+            const int y_superior = (OLED_ALTURA/4)  - L/2;
+            const int y_inferior = (OLED_ALTURA*3/4) - L/2;
+
+            for (uint8_t i = 0; i < usuarios_ativos && i < MAX_USUARIOS; ++i) {
+                int x = margem_x + (i % P_ROW)*(L+ESP);
+                int y = (i < P_ROW) ? y_superior : y_inferior;
+                ssd1306_rect(&oled, y, x, L, L, true, true);   // ícone “avatar”
             }
         }
-        
-        ssd1306_send_data(&display);
-        xSemaphoreGive(xMutexDisplay);
+
+        ssd1306_send_data(&oled);
+        xSemaphoreGive(mtx_oled);
     }
-    
+
+    /* A cada atualização de tela, também atualizamos LEDs e matriz. */
     atualizar_led_rgb();
-    atualizar_matriz_led();
+    atualizar_matriz();
 }
 
-// ===== ISR COM DEBOUNCE =====
-void gpio_irq_handler(uint gpio, uint32_t events) {
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    
-    if ((current_time - last_interrupt_time) > debounce_delay_ms) {
-        last_interrupt_time = current_time;
-        
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xSemaphoreGiveFromISR(xResetSem, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
+/* --------------------------------------------------------------------------- */
+/* 9. Interrupção do joystick (RESET)                                          */
+/* --------------------------------------------------------------------------- */
+static volatile uint32_t ultimo_irq_ms = 0;
+static const uint32_t   debounce_ms   = 400;
+
+static void irq_joystick(uint gpio, uint32_t eventos)
+{
+    uint32_t agora = to_ms_since_boot(get_absolute_time());
+    if (agora - ultimo_irq_ms < debounce_ms) return;   // debounce simples
+    ultimo_irq_ms = agora;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(sem_reset_irq, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-// ===== TASK BOTÃO A - ENTRADA =====
-void vTaskEntrada(void *pvParameters) {
-    bool botao_anterior = true;
-    bool botao_atual;
-    
-    while (1) {
-        botao_atual = gpio_get(BOTAO_A_GPIO);
-        
-        if (botao_anterior && !botao_atual) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            
-            if (!gpio_get(BOTAO_A_GPIO)) {
-                if (xSemaphoreTake(xSemaphoreContagem, 0) == pdTRUE) {
-                    xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-                    usuarios_ativos++;
+/* --------------------------------------------------------------------------- */
+/* 10. Tasks FreeRTOS                                                          */
+/* --------------------------------------------------------------------------- */
+
+/* Botão A – Entrada --------------------------------------------------------- */
+static void tarefa_entrada(void *arg)
+{
+    bool estado_ant = true;
+
+    while (true) {
+        bool estado_atual = gpio_get(PINO_BTN_ENTRADA);
+
+        if (estado_ant && !estado_atual) {             // borda de descida
+            vTaskDelay(pdMS_TO_TICKS(50));             // debounce por software
+
+            if (!gpio_get(PINO_BTN_ENTRADA)) {         // confirmou
+                if (xSemaphoreTake(sem_vagas, 0) == pdTRUE) {
+                    /* há vaga */
+                    xSemaphoreTake(mtx_usuarios, portMAX_DELAY);
+                    ++usuarios_ativos;
                     printf("[ENTRADA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
-                    atualizar_display_principal();
-                    xSemaphoreGive(xMutexUsuarios);
+                    xSemaphoreGive(mtx_usuarios);
+
+                    comando_display_t cmd = CMD_ATUALIZAR_TELA;
+                    xQueueSendToBack(fila_display, &cmd, 0);
                 } else {
-                    printf("[ENTRADA] LIMITE! %d/%d - BEEP\n", MAX_USUARIOS, MAX_USUARIOS);
+                    printf("[ENTRADA] LIMITE atingido!\n");
                 }
-                
-                while (!gpio_get(BOTAO_A_GPIO)) {
+                /* espera soltar botão */
+                while (!gpio_get(PINO_BTN_ENTRADA))
                     vTaskDelay(pdMS_TO_TICKS(10));
-                }
             }
         }
-        
-        botao_anterior = botao_atual;
+        estado_ant = estado_atual;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// ===== TASK BOTÃO B - SAÍDA =====
-void vTaskSaida(void *pvParameters) {
-    bool botao_anterior = true;
-    bool botao_atual;
-    
-    while (1) {
-        botao_atual = gpio_get(BOTAO_B_GPIO);
-        
-        if (botao_anterior && !botao_atual) {
+/* Botão B – Saída ----------------------------------------------------------- */
+static void tarefa_saida(void *arg)
+{
+    bool estado_ant = true;
+
+    while (true) {
+        bool estado_atual = gpio_get(PINO_BTN_SAIDA);
+
+        if (estado_ant && !estado_atual) {
             vTaskDelay(pdMS_TO_TICKS(50));
-            
-            if (!gpio_get(BOTAO_B_GPIO)) {
-                xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-                
+
+            if (!gpio_get(PINO_BTN_SAIDA)) {
+                xSemaphoreTake(mtx_usuarios, portMAX_DELAY);
+
                 if (usuarios_ativos > 0) {
-                    usuarios_ativos--;
-                    xSemaphoreGive(xSemaphoreContagem);
+                    --usuarios_ativos;
+                    xSemaphoreGive(sem_vagas);
                     printf("[SAIDA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
-                    atualizar_display_principal();
                 } else {
-                    printf("[SAIDA] Nenhum usuario ativo\n");
+                    printf("[SAIDA] Nenhum usuário ativo\n");
                 }
-                
-                xSemaphoreGive(xMutexUsuarios);
-                
-                while (!gpio_get(BOTAO_B_GPIO)) {
+
+                xSemaphoreGive(mtx_usuarios);
+
+                comando_display_t cmd = CMD_ATUALIZAR_TELA;
+                xQueueSendToBack(fila_display, &cmd, 0);
+
+                while (!gpio_get(PINO_BTN_SAIDA))
                     vTaskDelay(pdMS_TO_TICKS(10));
-                }
             }
         }
-        
-        botao_anterior = botao_atual;
+        estado_ant = estado_atual;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// ===== TASK RESET - JOYSTICK COM INTERRUPÇÃO =====
-void vTaskReset(void *pvParameters) {
-    while (1) {
-        if (xSemaphoreTake(xResetSem, portMAX_DELAY) == pdTRUE) {
-            xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-            
-            int vagas_ocupadas = usuarios_ativos;
-            for (int i = 0; i < vagas_ocupadas; i++) {
-                xSemaphoreGive(xSemaphoreContagem);
-            }
-            
+/* RESET via joystick -------------------------------------------------------- */
+static void tarefa_reset(void *arg)
+{
+    comando_display_t cmd_show  = CMD_MOSTRAR_MSG_RESET;
+    comando_display_t cmd_clear = CMD_OCULTAR_MSG_RESET;
+
+    while (true) {
+        /* espera IRQ do joystick */
+        if (xSemaphoreTake(sem_reset_irq, portMAX_DELAY) == pdTRUE) {
+            xSemaphoreTake(mtx_usuarios, portMAX_DELAY);
+
+            /* devolve vagas ao semáforo */
+            for (uint8_t i = 0; i < usuarios_ativos; ++i) xSemaphoreGive(sem_vagas);
             usuarios_ativos = 0;
-            contador_resets++;
-            
-            printf("[RESET] Sistema resetado! Total: %d/%d - BEEP DUPLO (Reset #%d)\n", 
-                   usuarios_ativos, MAX_USUARIOS, contador_resets);
-            
-            mostrar_resetado = true;
-            atualizar_display_principal();
-            
-            xSemaphoreGive(xMutexUsuarios);
-            
+            ++total_resets;
+
+            printf("[RESET] Sistema zerado (reset #%ld)\n", total_resets);
+
+            xSemaphoreGive(mtx_usuarios);
+
+            xQueueSendToBack(fila_display, &cmd_show, 0);
             vTaskDelay(pdMS_TO_TICKS(2000));
-            
-            xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-            mostrar_resetado = false;
-            atualizar_display_principal();
-            xSemaphoreGive(xMutexUsuarios);
+            xQueueSendToBack(fila_display, &cmd_clear, 0);
         }
     }
 }
 
-// ===== TASK PARA ALTERNAR TELAS =====
-void vTaskAlternarTelas(void *pvParameters) {
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000)); 
-
-        xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
-        tela_atual_stats = !tela_atual_stats; 
-        atualizar_display_principal(); 
-        xSemaphoreGive(xMutexUsuarios);
+/* Alterna tela a cada 2 s --------------------------------------------------- */
+static void tarefa_alternar_tela(void *arg)
+{
+    comando_display_t cmd = CMD_ALTERNAR_TELA;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        xQueueSendToBack(fila_display, &cmd, 0);
     }
 }
 
-// ===== FUNÇÃO PRINCIPAL =====
-int main() {
-    stdio_init_all();
-    
-    i2c_init(I2C_PORT, 400 * 1000);
+/* Gerencia todos os comandos de desenho ------------------------------------ */
+static void tarefa_display(void *arg)
+{
+    comando_display_t cmd;
+
+    while (true) {
+        if (xQueueReceive(fila_display, &cmd, portMAX_DELAY) == pdPASS) {
+            switch (cmd) {
+                case CMD_ATUALIZAR_TELA:        desenhar_tela(); break;
+                case CMD_MOSTRAR_MSG_RESET:     mostrar_msg_reset = true;  desenhar_tela(); break;
+                case CMD_OCULTAR_MSG_RESET:     mostrar_msg_reset = false; desenhar_tela(); break;
+                case CMD_ALTERNAR_TELA:         tela_stats_ativa = !tela_stats_ativa;       desenhar_tela(); break;
+            }
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------- */
+/* 11. Configuração inicial (main)                                             */
+/* --------------------------------------------------------------------------- */
+int main(void)
+{
+    stdio_init_all();      
+
+    /* ---------- I²C + OLED -------------------------------------------------- */
+    i2c_init(I2C_PORT, 400000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-    
-    ssd1306_init(&display, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_ADDRESS, I2C_PORT);
-    ssd1306_config(&display);
-    
+    gpio_pull_up(I2C_SDA);  gpio_pull_up(I2C_SCL);
+
+    ssd1306_init(&oled, OLED_LARGURA, OLED_ALTURA, false, OLED_ENDERECO, I2C_PORT);
+    ssd1306_config(&oled);
+
+    /* ---------- Matriz 5×5 -------------------------------------------------- */
     inicializar_matriz_led();
-    printf("Matriz LED 5x5 inicializada!\n");
-    
-    gpio_init(LED_VERDE_GPIO);
-    gpio_set_dir(LED_VERDE_GPIO, GPIO_OUT);
-    gpio_put(LED_VERDE_GPIO, 0);
-    
-    gpio_init(LED_AZUL_GPIO);
-    gpio_set_dir(LED_AZUL_GPIO, GPIO_OUT);
-    gpio_put(LED_AZUL_GPIO, 0);
-    
-    gpio_init(LED_VERMELHO_GPIO);
-    gpio_set_dir(LED_VERMELHO_GPIO, GPIO_OUT);
-    gpio_put(LED_VERMELHO_GPIO, 0);
-    
-    gpio_init(BOTAO_A_GPIO);
-    gpio_set_dir(BOTAO_A_GPIO, GPIO_IN);
-    gpio_pull_up(BOTAO_A_GPIO);
-    
-    gpio_init(BOTAO_B_GPIO);
-    gpio_set_dir(BOTAO_B_GPIO, GPIO_IN);
-    gpio_pull_up(BOTAO_B_GPIO);
-    
-    gpio_init(JOYSTICK_GPIO);
-    gpio_set_dir(JOYSTICK_GPIO, GPIO_IN);
-    gpio_pull_up(JOYSTICK_GPIO);
-    gpio_set_irq_enabled_with_callback(JOYSTICK_GPIO, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
-    
-    xMutexUsuarios = xSemaphoreCreateMutex();
-    xMutexDisplay = xSemaphoreCreateMutex();
-    xResetSem = xSemaphoreCreateBinary();
-    xSemaphoreContagem = xSemaphoreCreateCounting(MAX_USUARIOS, MAX_USUARIOS);
-    
-    atualizar_display_principal();
-    
-    xTaskCreate(vTaskEntrada, "TaskEntrada", 1024, NULL, 2, NULL);
-    xTaskCreate(vTaskSaida, "TaskSaida", 1024, NULL, 2, NULL);
-    xTaskCreate(vTaskReset, "TaskReset", 1024, NULL, 3, NULL);
-    xTaskCreate(vTaskAlternarTelas, "TaskAlternarTelas", 1024, NULL, 1, NULL); 
-    
-    printf("Sistema completo iniciado!\n");
-    
+
+    /* ---------- LEDs -------------------------------------------------------- */
+    gpio_init(PINO_LED_VERDE);   gpio_set_dir(PINO_LED_VERDE, GPIO_OUT);
+    gpio_init(PINO_LED_AZUL);    gpio_set_dir(PINO_LED_AZUL,  GPIO_OUT);
+    gpio_init(PINO_LED_VERMELHO);gpio_set_dir(PINO_LED_VERMELHO, GPIO_OUT);
+
+    /* ---------- Botões / Joystick ------------------------------------------ */
+    gpio_init(PINO_BTN_ENTRADA); gpio_set_dir(PINO_BTN_ENTRADA, GPIO_IN); gpio_pull_up(PINO_BTN_ENTRADA);
+    gpio_init(PINO_BTN_SAIDA);   gpio_set_dir(PINO_BTN_SAIDA,   GPIO_IN); gpio_pull_up(PINO_BTN_SAIDA);
+
+    gpio_init(PINO_JOYSTICK_RESET);
+    gpio_set_dir(PINO_JOYSTICK_RESET, GPIO_IN); gpio_pull_up(PINO_JOYSTICK_RESET);
+    gpio_set_irq_enabled_with_callback(PINO_JOYSTICK_RESET, GPIO_IRQ_EDGE_FALL, true, &irq_joystick);
+
+    /* ---------- Sincronização ---------------------------------------------- */
+    mtx_usuarios   = xSemaphoreCreateMutex();
+    mtx_oled       = xSemaphoreCreateMutex();
+    sem_reset_irq  = xSemaphoreCreateBinary();
+    sem_vagas      = xSemaphoreCreateCounting(MAX_USUARIOS, MAX_USUARIOS);
+
+    //fila
+    fila_display   = xQueueCreate(TAM_FILA_DISPLAY, sizeof(comando_display_t));
+
+    configASSERT(mtx_usuarios && mtx_oled && sem_reset_irq && sem_vagas && fila_display);
+
+    /* ---------- UI inicial -------------------------------------------------- */
+    desenhar_tela();
+
+    /* ---------- Criação das tasks ------------------------------------------ */
+    xTaskCreate(tarefa_entrada,        "Entrada",        1024, NULL, 2, NULL);
+    xTaskCreate(tarefa_saida,          "Saida",          1024, NULL, 2, NULL);
+    xTaskCreate(tarefa_reset,          "Reset",          1024, NULL, 3, NULL);
+    xTaskCreate(tarefa_alternar_tela,  "AlternarTela",   1024, NULL, 1, NULL);
+    xTaskCreate(tarefa_display,        "Display",        1024, NULL, 2, NULL);
+
+    printf("Sistema iniciado!\n");
+
     vTaskStartScheduler();
-    
-    return 0;
+    /* Nunca deve chegar aqui */
+    while (true);
 }
