@@ -42,7 +42,7 @@ ssd1306_t display;
 
 // Variáveis para debounce da interrupção
 volatile uint32_t last_interrupt_time = 0;
-const uint32_t debounce_delay_ms = 200;
+const uint32_t debounce_delay_ms = 400;
 
 // ===== FUNÇÃO PARA OBTER COR DA MATRIZ LED BASEADA NO NÚMERO =====
 uint32_t obter_cor_numero(int numero) {
