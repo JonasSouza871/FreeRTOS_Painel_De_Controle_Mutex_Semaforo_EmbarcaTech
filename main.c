@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "FreeRTOS.h"
+#include "FreeRTOS.h" 
 #include "task.h"
 #include "semphr.h"
 #include "hardware/gpio.h"
@@ -31,6 +31,7 @@
 volatile int usuarios_ativos = 0;
 volatile int contador_resets = 0;
 volatile bool mostrar_resetado = false;
+volatile bool tela_atual_stats = true; 
 
 SemaphoreHandle_t xMutexUsuarios;
 SemaphoreHandle_t xMutexDisplay;
@@ -46,33 +47,30 @@ const uint32_t debounce_delay_ms = 400;
 
 // ===== FUNÇÃO PARA OBTER COR DA MATRIZ LED BASEADA NO NÚMERO =====
 uint32_t obter_cor_numero(int numero) {
-    // Cores diferentes para cada número de usuário (0-9)
     const uint32_t cores_numeros[] = {
-        COR_AZUL,      // 0 usuários - AZUL
-        COR_VERDE,     // 1 usuário - VERDE
-        COR_LARANJA,   // 2 usuários - LARANJA
-        COR_VIOLETA,   // 3 usuários - VIOLETA
-        COR_OURO,      // 4 usuários - OURO
-        COR_PRATA,     // 5 usuários - PRATA
-        COR_MARROM,    // 6 usuários - MARROM
-        COR_BRANCO,    // 7 usuários - BRANCO
-        COR_CINZA,     // 8 usuários - CINZA
-        COR_AMARELO    // 9 usuários - AMARELO (quase cheio)
+        COR_AZUL,      
+        COR_VERDE,     
+        COR_LARANJA,   
+        COR_VIOLETA,   
+        COR_OURO,      
+        COR_PRATA,     
+        COR_MARROM,    
+        COR_BRANCO,    
+        COR_CINZA,     
+        COR_AMARELO    
     };
     
     if (numero >= 0 && numero <= 9) {
         return cores_numeros[numero];
     }
-    return COR_VERMELHO;  // Cor padrão para erro
+    return COR_VERMELHO; 
 }
 
 // ===== FUNÇÃO PARA ATUALIZAR MATRIZ LED =====
 void atualizar_matriz_led() {
     if (usuarios_ativos == MAX_USUARIOS) {
-        // Mostra X vermelho fixo quando atingir 10 usuários
         matriz_draw_pattern(PAD_X, COR_VERMELHO);
     } else {
-        // Mostra número de usuários com cor correspondente (0-9)
         uint32_t cor = obter_cor_numero(usuarios_ativos);
         matriz_draw_number(usuarios_ativos, cor);
     }
@@ -119,42 +117,70 @@ void atualizar_led_rgb() {
     }
 }
 
-// ===== FUNÇÃO PARA ATUALIZAR DISPLAY COMPLETA =====
-void atualizar_display() {
+// ===== FUNÇÃO PARA ATUALIZAR DISPLAY COMPLETA (AGORA DECIDE QUAL TELA MOSTRAR) =====
+void atualizar_display_principal() {
     if (xSemaphoreTake(xMutexDisplay, pdMS_TO_TICKS(100)) == pdTRUE) {
-        char linha1[32], linha2[32], linha3[32], linha4[32], linha5[32];
-        
-        sprintf(linha1, "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
-        
-        if (usuarios_ativos == 0) {
-            sprintf(linha2, "Estado: VAZIO");
-        } else if (usuarios_ativos == MAX_USUARIOS) {
-            sprintf(linha2, "Estado: LOTADO");
-        } else if (usuarios_ativos == MAX_USUARIOS - 1) {
-            sprintf(linha2, "Estado:ENCHENDO");
+        ssd1306_fill(&display, false); 
+
+        if (tela_atual_stats) {
+            char linha1[32], linha2[32], linha3[32], linha4[32], linha5[32];
+            
+            sprintf(linha1, "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
+            
+            if (usuarios_ativos == 0) {
+                sprintf(linha2, "Estado: VAZIO");
+            } else if (usuarios_ativos == MAX_USUARIOS) {
+                sprintf(linha2, "Estado: LOTADO");
+            } else if (usuarios_ativos == MAX_USUARIOS - 1) {
+                sprintf(linha2, "Estado:ENCHENDO");
+            } else {
+                sprintf(linha2, "Estado: NORMAL");
+            }
+            
+            sprintf(linha3, "LED: %s", obter_cor_led());
+            sprintf(linha4, "Resets: %d", contador_resets);
+            
+            ssd1306_draw_string(&display, linha1, 2, 2, false);
+            ssd1306_draw_string(&display, linha2, 2, 14, false);  
+            ssd1306_draw_string(&display, linha3, 2, 26, false);
+            ssd1306_draw_string(&display, linha4, 2, 38, false);
+            
+            if (mostrar_resetado) {
+                sprintf(linha5, "** RESETADO! **");
+                ssd1306_draw_string(&display, linha5, 15, 52, false);
+            }
         } else {
-            sprintf(linha2, "Estado: NORMAL");
-        }
-        
-        sprintf(linha3, "LED: %s", obter_cor_led());
-        sprintf(linha4, "Resets: %d", contador_resets);
-        
-        ssd1306_fill(&display, false);
-        ssd1306_draw_string(&display, linha1, 2, 2, false);
-        ssd1306_draw_string(&display, linha2, 2, 14, false);  
-        ssd1306_draw_string(&display, linha3, 2, 26, false);
-        ssd1306_draw_string(&display, linha4, 2, 38, false);
-        
-        if (mostrar_resetado) {
-            sprintf(linha5, "** RESETADO! **");
-            ssd1306_draw_string(&display, linha5, 15, 52, false);
+            const int ICON_WIDTH = 12;
+            const int ICON_HEIGHT = 12;
+            const int SPACING = 8;
+            const int ICONS_PER_ROW = 5;
+            const int CONTENT_WIDTH_ROW = (ICONS_PER_ROW * ICON_WIDTH) + ((ICONS_PER_ROW > 1 ? ICONS_PER_ROW - 1 : 0) * SPACING);
+            const int MARGIN_X = (DISPLAY_WIDTH - CONTENT_WIDTH_ROW) / 2;
+            
+            const int Y_ROW1 = (DISPLAY_HEIGHT / 4) - (ICON_HEIGHT / 2);
+            const int Y_ROW2 = (DISPLAY_HEIGHT * 3 / 4) - (ICON_HEIGHT / 2);
+
+            int usuarios_para_desenhar = usuarios_ativos;
+
+            for (int i = 0; i < usuarios_para_desenhar && i < MAX_USUARIOS; ++i) {
+                int x_pos, y_pos;
+                if (i < ICONS_PER_ROW) { 
+                    x_pos = MARGIN_X + (i * (ICON_WIDTH + SPACING));
+                    y_pos = Y_ROW1;
+                } else { 
+                    x_pos = MARGIN_X + ((i - ICONS_PER_ROW) * (ICON_WIDTH + SPACING));
+                    y_pos = Y_ROW2;
+                }
+                // Corrigido para usar ssd1306_rect com os parâmetros corretos
+                // top, left, width, height, value, fill
+                ssd1306_rect(&display, y_pos, x_pos, ICON_WIDTH, ICON_HEIGHT, true, true);
+            }
         }
         
         ssd1306_send_data(&display);
         xSemaphoreGive(xMutexDisplay);
     }
     
-    // Atualiza LED RGB e Matriz LED juntos
     atualizar_led_rgb();
     atualizar_matriz_led();
 }
@@ -188,7 +214,7 @@ void vTaskEntrada(void *pvParameters) {
                     xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
                     usuarios_ativos++;
                     printf("[ENTRADA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
-                    atualizar_display();
+                    atualizar_display_principal();
                     xSemaphoreGive(xMutexUsuarios);
                 } else {
                     printf("[ENTRADA] LIMITE! %d/%d - BEEP\n", MAX_USUARIOS, MAX_USUARIOS);
@@ -223,7 +249,7 @@ void vTaskSaida(void *pvParameters) {
                     usuarios_ativos--;
                     xSemaphoreGive(xSemaphoreContagem);
                     printf("[SAIDA] Total: %d/%d\n", usuarios_ativos, MAX_USUARIOS);
-                    atualizar_display();
+                    atualizar_display_principal();
                 } else {
                     printf("[SAIDA] Nenhum usuario ativo\n");
                 }
@@ -259,7 +285,7 @@ void vTaskReset(void *pvParameters) {
                    usuarios_ativos, MAX_USUARIOS, contador_resets);
             
             mostrar_resetado = true;
-            atualizar_display();
+            atualizar_display_principal();
             
             xSemaphoreGive(xMutexUsuarios);
             
@@ -267,9 +293,21 @@ void vTaskReset(void *pvParameters) {
             
             xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
             mostrar_resetado = false;
-            atualizar_display();
+            atualizar_display_principal();
             xSemaphoreGive(xMutexUsuarios);
         }
+    }
+}
+
+// ===== TASK PARA ALTERNAR TELAS =====
+void vTaskAlternarTelas(void *pvParameters) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000)); 
+
+        xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
+        tela_atual_stats = !tela_atual_stats; 
+        atualizar_display_principal(); 
+        xSemaphoreGive(xMutexUsuarios);
     }
 }
 
@@ -277,7 +315,6 @@ void vTaskReset(void *pvParameters) {
 int main() {
     stdio_init_all();
     
-    // ===== CONFIGURAÇÃO DO I2C E DISPLAY =====
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
@@ -287,11 +324,9 @@ int main() {
     ssd1306_init(&display, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_ADDRESS, I2C_PORT);
     ssd1306_config(&display);
     
-    // ===== CONFIGURAÇÃO DA MATRIZ LED =====
     inicializar_matriz_led();
     printf("Matriz LED 5x5 inicializada!\n");
     
-    // ===== CONFIGURAÇÃO DOS LEDS RGB =====
     gpio_init(LED_VERDE_GPIO);
     gpio_set_dir(LED_VERDE_GPIO, GPIO_OUT);
     gpio_put(LED_VERDE_GPIO, 0);
@@ -304,7 +339,6 @@ int main() {
     gpio_set_dir(LED_VERMELHO_GPIO, GPIO_OUT);
     gpio_put(LED_VERMELHO_GPIO, 0);
     
-    // ===== CONFIGURAÇÃO DOS PINOS =====
     gpio_init(BOTAO_A_GPIO);
     gpio_set_dir(BOTAO_A_GPIO, GPIO_IN);
     gpio_pull_up(BOTAO_A_GPIO);
@@ -318,23 +352,20 @@ int main() {
     gpio_pull_up(JOYSTICK_GPIO);
     gpio_set_irq_enabled_with_callback(JOYSTICK_GPIO, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
     
-    // ===== CRIAÇÃO DOS SEMÁFOROS =====
     xMutexUsuarios = xSemaphoreCreateMutex();
     xMutexDisplay = xSemaphoreCreateMutex();
     xResetSem = xSemaphoreCreateBinary();
     xSemaphoreContagem = xSemaphoreCreateCounting(MAX_USUARIOS, MAX_USUARIOS);
     
-    // ===== EXIBE TELA INICIAL =====
-    atualizar_display();
+    atualizar_display_principal();
     
-    // ===== CRIAÇÃO DAS TASKS =====
     xTaskCreate(vTaskEntrada, "TaskEntrada", 1024, NULL, 2, NULL);
     xTaskCreate(vTaskSaida, "TaskSaida", 1024, NULL, 2, NULL);
     xTaskCreate(vTaskReset, "TaskReset", 1024, NULL, 3, NULL);
+    xTaskCreate(vTaskAlternarTelas, "TaskAlternarTelas", 1024, NULL, 1, NULL); 
     
     printf("Sistema completo iniciado!\n");
     
-    // ===== INICIA O SCHEDULER =====
     vTaskStartScheduler();
     
     return 0;
