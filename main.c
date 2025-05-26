@@ -51,7 +51,7 @@ volatile bool mostrar_msg_reset        = false;
 volatile bool tela_stats_ativa         = true; // true = Estatísticas, false = Avatares
 
 /* --------------------------------------------------------------------------- */
-/* 4. Handles de FreeRTOS (mutexes, semáforos, filas)                          */
+/* 4.  FreeRTOS (mutexes, semáforos, filas A serem usados)                           */
 /* --------------------------------------------------------------------------- */
 static SemaphoreHandle_t mtx_usuarios;
 static SemaphoreHandle_t mtx_oled;
@@ -190,7 +190,7 @@ static void irq_joystick(uint gpio, uint32_t eventos)
 /* --------------------------------------------------------------------------- */
 
 /* Botão A – Entrada --------------------------------------------------------- */
-static void tarefa_entrada(void *arg)
+static void task_entrada(void *arg)
 {
     bool estado_ant = true;
 
@@ -224,7 +224,7 @@ static void tarefa_entrada(void *arg)
 }
 
 /* Botão B – Saída ----------------------------------------------------------- */
-static void tarefa_saida(void *arg)
+static void task_saida(void *arg)
 {
     bool estado_ant = true;
 
@@ -260,7 +260,7 @@ static void tarefa_saida(void *arg)
 }
 
 /* RESET via joystick -------------------------------------------------------- */
-static void tarefa_reset(void *arg)
+static void task_reset(void *arg)
 {
     comando_display_t cmd_show  = CMD_MOSTRAR_MSG_RESET;
     comando_display_t cmd_clear = CMD_OCULTAR_MSG_RESET;
@@ -287,7 +287,7 @@ static void tarefa_reset(void *arg)
 }
 
 /* Alterna tela a cada 2 s --------------------------------------------------- */
-static void tarefa_alternar_tela(void *arg)
+static void task_alternar_tela(void *arg)
 {
     comando_display_t cmd = CMD_ALTERNAR_TELA;
     while (true) {
@@ -297,7 +297,7 @@ static void tarefa_alternar_tela(void *arg)
 }
 
 /* Gerencia todos os comandos de desenho ------------------------------------ */
-static void tarefa_display(void *arg)
+static void task_display(void *arg)
 {
     comando_display_t cmd;
 
@@ -360,11 +360,11 @@ int main(void)
     desenhar_tela();
 
     /* ---------- Criação das tasks ------------------------------------------ */
-    xTaskCreate(tarefa_entrada,        "Entrada",        1024, NULL, 2, NULL);
-    xTaskCreate(tarefa_saida,          "Saida",          1024, NULL, 2, NULL);
-    xTaskCreate(tarefa_reset,          "Reset",          1024, NULL, 3, NULL);
-    xTaskCreate(tarefa_alternar_tela,  "AlternarTela",   1024, NULL, 1, NULL);
-    xTaskCreate(tarefa_display,        "Display",        1024, NULL, 2, NULL);
+    xTaskCreate(task_entrada,        "Entrada",        1024, NULL, 2, NULL);
+    xTaskCreate(task_saida,          "Saida",          1024, NULL, 2, NULL);
+    xTaskCreate(task_reset,          "Reset",          1024, NULL, 3, NULL);
+    xTaskCreate(task_alternar_tela,  "AlternarTela",   1024, NULL, 1, NULL);
+    xTaskCreate(task_display,        "Display",        1024, NULL, 2, NULL);
 
     printf("Sistema iniciado!\n");
 
