@@ -6,6 +6,7 @@
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "lib/Display_Bibliotecas/ssd1306.h"
+#include "lib/Matriz_Bibliotecas/matriz_led.h"  // Nova biblioteca da matriz LED
 
 // ===== DEFINIÇÕES =====
 #define BOTAO_A_GPIO 5      
@@ -28,8 +29,9 @@
 
 // ===== VARIÁVEIS GLOBAIS =====
 volatile int usuarios_ativos = 0;
-volatile int contador_resets = 0;  // Nova variável para contar resets
-volatile bool mostrar_resetado = false;  // Flag para mostrar "RESETADO!"
+volatile int contador_resets = 0;
+volatile bool mostrar_resetado = false;
+volatile bool mostrar_x_vermelho = false;  // Nova flag para X vermelho
 
 SemaphoreHandle_t xMutexUsuarios;
 SemaphoreHandle_t xMutexDisplay;
@@ -42,6 +44,44 @@ ssd1306_t display;
 // Variáveis para debounce da interrupção
 volatile uint32_t last_interrupt_time = 0;
 const uint32_t debounce_delay_ms = 200;
+
+// ===== FUNÇÃO PARA OBTER COR DA MATRIZ LED BASEADA NO NÚMERO =====
+uint32_t obter_cor_numero(int numero) {
+    // Cores diferentes para cada número de usuário (0-9)
+    const uint32_t cores_numeros[] = {
+        COR_AZUL,      // 0 usuários - AZUL
+        COR_VERDE,     // 1 usuário - VERDE
+        COR_VERDE,     // 2 usuários - VERDE
+        COR_VERDE,     // 3 usuários - VERDE
+        COR_VERDE,     // 4 usuários - VERDE
+        COR_VERDE,     // 5 usuários - VERDE
+        COR_VERDE,     // 6 usuários - VERDE
+        COR_VERDE,     // 7 usuários - VERDE
+        COR_VERDE,     // 8 usuários - VERDE
+        COR_AMARELO,   // 9 usuários - AMARELO (quase cheio)
+        COR_VERMELHO   // 10 usuários - VERMELHO (lotado)
+    };
+    
+    if (numero >= 0 && numero <= 10) {
+        return cores_numeros[numero];
+    }
+    return COR_VERMELHO;  // Cor padrão para erro
+}
+
+// ===== FUNÇÃO PARA ATUALIZAR MATRIZ LED =====
+void atualizar_matriz_led() {
+    if (mostrar_x_vermelho) {
+        // Mostra X vermelho quando tenta exceder limite
+        matriz_draw_pattern(PAD_X, COR_VERMELHO);
+    } else if (usuarios_ativos <= 9) {
+        // Mostra número de usuários com cor correspondente
+        uint32_t cor = obter_cor_numero(usuarios_ativos);
+        matriz_draw_number(usuarios_ativos, cor);
+    } else {
+        // Se for 10 usuários, mostra 1 com cor vermelha (representa "10" como "1" vermelho)
+        matriz_draw_number(1, COR_VERMELHO);
+    }
+}
 
 // ===== FUNÇÃO PARA OBTER COR DO LED EM TEXTO =====
 const char* obter_cor_led() {
@@ -63,25 +103,21 @@ const char* obter_cor_led() {
 // ===== FUNÇÃO PARA CONTROLAR LED RGB =====
 void atualizar_led_rgb() {
     if (usuarios_ativos == 0) {
-        // AZUL - Nenhum usuário logado
         gpio_put(LED_AZUL_GPIO, 1);
         gpio_put(LED_VERDE_GPIO, 0);
         gpio_put(LED_VERMELHO_GPIO, 0);
     } 
     else if (usuarios_ativos >= 1 && usuarios_ativos <= MAX_USUARIOS - 2) {
-        // VERDE - Usuários ativos (de 1 a MAX-2, ou seja, 1 a 8)
         gpio_put(LED_AZUL_GPIO, 0);
         gpio_put(LED_VERDE_GPIO, 1);
         gpio_put(LED_VERMELHO_GPIO, 0);
     }
     else if (usuarios_ativos == MAX_USUARIOS - 1) {
-        // AMARELO - Apenas 1 vaga restante (MAX-1, ou seja, 9)
         gpio_put(LED_AZUL_GPIO, 0);
         gpio_put(LED_VERDE_GPIO, 1);    
         gpio_put(LED_VERMELHO_GPIO, 1); 
     }
     else if (usuarios_ativos == MAX_USUARIOS) {
-        // VERMELHO - Capacidade máxima (MAX, ou seja, 10)
         gpio_put(LED_AZUL_GPIO, 0);
         gpio_put(LED_VERDE_GPIO, 0);
         gpio_put(LED_VERMELHO_GPIO, 1);
@@ -93,47 +129,51 @@ void atualizar_display() {
     if (xSemaphoreTake(xMutexDisplay, pdMS_TO_TICKS(100)) == pdTRUE) {
         char linha1[32], linha2[32], linha3[32], linha4[32], linha5[32];
         
-        // Linha 1: Usuarios: x/10
         sprintf(linha1, "Usuarios: %d/%d", usuarios_ativos, MAX_USUARIOS);
         
-        // Linha 2: Estado (EM MAIÚSCULA)
         if (usuarios_ativos == 0) {
             sprintf(linha2, "Estado: VAZIO");
         } else if (usuarios_ativos == MAX_USUARIOS) {
             sprintf(linha2, "Estado: LOTADO");
         } else if (usuarios_ativos == MAX_USUARIOS - 1) {
-            sprintf(linha2, "Estado: ENCHENDO");
+            sprintf(linha2, "Estado:ENCHENDO");
         } else {
             sprintf(linha2, "Estado: NORMAL");
         }
         
-        // Linha 3: Cor do LED
         sprintf(linha3, "LED: %s", obter_cor_led());
-        
-        // Linha 4: Quantidade de resets
         sprintf(linha4, "Resets: %d", contador_resets);
         
-        // Limpa display
         ssd1306_fill(&display, false);
+        ssd1306_draw_string(&display, linha1, 2, 2, false);
+        ssd1306_draw_string(&display, linha2, 2, 14, false);  
+        ssd1306_draw_string(&display, linha3, 2, 26, false);
+        ssd1306_draw_string(&display, linha4, 2, 38, false);
         
-        // Desenha as 4 informações principais
-        ssd1306_draw_string(&display, linha1, 2, 2, false);   // Linha 1
-        ssd1306_draw_string(&display, linha2, 2, 14, false);  // Linha 2  
-        ssd1306_draw_string(&display, linha3, 2, 26, false);  // Linha 3
-        ssd1306_draw_string(&display, linha4, 2, 38, false);  // Linha 4
-        
-        // Linha 5: RESETADO! (se ativo)
         if (mostrar_resetado) {
             sprintf(linha5, "** RESETADO! **");
-            ssd1306_draw_string(&display, linha5, 15, 52, false); // Última linha, centralizado
+            ssd1306_draw_string(&display, linha5, 15, 52, false);
         }
         
         ssd1306_send_data(&display);
         xSemaphoreGive(xMutexDisplay);
     }
     
-    // Atualiza LED RGB junto com o display
+    // Atualiza LED RGB e Matriz LED juntos
     atualizar_led_rgb();
+    atualizar_matriz_led();
+}
+
+// ===== TASK PARA CONTROLAR X VERMELHO TEMPORÁRIO =====
+void vTaskXVermelho(void *pvParameters) {
+    while (1) {
+        if (mostrar_x_vermelho) {
+            vTaskDelay(pdMS_TO_TICKS(2000));  // Espera 2 segundos
+            mostrar_x_vermelho = false;
+            atualizar_matriz_led();  // Atualiza matriz para voltar ao número
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Verifica a cada 100ms
+    }
 }
 
 // ===== ISR COM DEBOUNCE =====
@@ -168,7 +208,10 @@ void vTaskEntrada(void *pvParameters) {
                     atualizar_display();
                     xSemaphoreGive(xMutexUsuarios);
                 } else {
+                    // Sistema cheio - mostra X vermelho por 2 segundos
                     printf("[ENTRADA] LIMITE! %d/%d - BEEP\n", MAX_USUARIOS, MAX_USUARIOS);
+                    mostrar_x_vermelho = true;
+                    atualizar_matriz_led();
                 }
                 
                 while (!gpio_get(BOTAO_A_GPIO)) {
@@ -224,28 +267,25 @@ void vTaskReset(void *pvParameters) {
         if (xSemaphoreTake(xResetSem, portMAX_DELAY) == pdTRUE) {
             xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
             
-            // Restaura todas as vagas no semáforo de contagem
             int vagas_ocupadas = usuarios_ativos;
             for (int i = 0; i < vagas_ocupadas; i++) {
                 xSemaphoreGive(xSemaphoreContagem);
             }
             
             usuarios_ativos = 0;
-            contador_resets++;  // Incrementa contador de resets
+            contador_resets++;
             
             printf("[RESET] Sistema resetado! Total: %d/%d - BEEP DUPLO (Reset #%d)\n", 
                    usuarios_ativos, MAX_USUARIOS, contador_resets);
             
-            // Ativa flag para mostrar "RESETADO!"
             mostrar_resetado = true;
+            mostrar_x_vermelho = false;  // Remove X vermelho se estiver ativo
             atualizar_display();
             
             xSemaphoreGive(xMutexUsuarios);
             
-            // Mostra "RESETADO!" por 2 segundos
             vTaskDelay(pdMS_TO_TICKS(2000));
             
-            // Remove mensagem "RESETADO!" e atualiza display novamente
             xSemaphoreTake(xMutexUsuarios, portMAX_DELAY);
             mostrar_resetado = false;
             atualizar_display();
@@ -267,6 +307,10 @@ int main() {
     
     ssd1306_init(&display, DISPLAY_WIDTH, DISPLAY_HEIGHT, false, DISPLAY_ADDRESS, I2C_PORT);
     ssd1306_config(&display);
+    
+    // ===== CONFIGURAÇÃO DA MATRIZ LED =====
+    inicializar_matriz_led();  // Inicializa PIO para WS2812
+    printf("Matriz LED 5x5 inicializada!\n");
     
     // ===== CONFIGURAÇÃO DOS LEDS RGB =====
     gpio_init(LED_VERDE_GPIO);
@@ -308,6 +352,9 @@ int main() {
     xTaskCreate(vTaskEntrada, "TaskEntrada", 1024, NULL, 2, NULL);
     xTaskCreate(vTaskSaida, "TaskSaida", 1024, NULL, 2, NULL);
     xTaskCreate(vTaskReset, "TaskReset", 1024, NULL, 3, NULL);
+    xTaskCreate(vTaskXVermelho, "TaskXVermelho", 512, NULL, 1, NULL);  // Nova task para X vermelho
+    
+    printf("Sistema completo iniciado com Matriz LED!\n");
     
     // ===== INICIA O SCHEDULER =====
     vTaskStartScheduler();
