@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include "hardware/pwm.h"                
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -30,8 +31,9 @@
 #define PINO_LED_AZUL         12
 #define PINO_LED_VERMELHO     13
 
-/* BUZZER piezo */
+/* BUZZER piezo (PWM) */
 #define PINO_BUZZER           10
+#define PWM_FREQUENCIA_BUZZER 2000   // 2 kHz
 
 /* --------------------------------------------------------------------------- */
 /* 2. Tipos, enuns e tamanhos de filas                                         */
@@ -48,8 +50,8 @@ typedef enum {
 /* --------------------------------------------------------------------------- */
 /* 3. Variáveis globais protegidas por mutex                                   */
 /* --------------------------------------------------------------------------- */
-volatile uint8_t  usuarios_ativos = 0;    // 0-10
-volatile uint32_t total_resets    = 0;
+volatile uint8_t  usuarios_ativos   = 0;    // 0-10
+volatile uint32_t total_resets      = 0;
 volatile bool     mostrar_msg_reset = false;
 volatile bool     tela_stats_ativa  = true; // true = Estatísticas, false = Avatares
 
@@ -63,9 +65,16 @@ static SemaphoreHandle_t sem_vagas;        // counting semaphore
 static QueueHandle_t     fila_display;
 
 /* --------------------------------------------------------------------------- */
-/* 5. Instância do display SSD1306                                             */
+/* 5. Instâncias e utilidades                                                  */
 /* --------------------------------------------------------------------------- */
 static ssd1306_t oled;
+
+static uint slice_buzzer;
+static uint channel_buzzer;
+
+/* Aciona / desliga o PWM do buzzer */
+static inline void buzzer_on(void)  { pwm_set_enabled(slice_buzzer, true);  }
+static inline void buzzer_off(void) { pwm_set_enabled(slice_buzzer, false); }
 
 /* --------------------------------------------------------------------------- */
 /* 6. Utilitário de cor p/ matriz 5×5                                          */
@@ -98,9 +107,9 @@ static void desenhar_tela(void)
             else if (usuarios_ativos == MAX_USUARIOS-1)    sprintf(buf[1], "Estado: ENCHENDO");
             else                                           sprintf(buf[1], "Estado: NORMAL");
 
-            const char *cor_txt = (usuarios_ativos==0)         ? "AZUL"   :
-                                  (usuarios_ativos<=MAX_USUARIOS-2)? "VERDE"  :
-                                  (usuarios_ativos==MAX_USUARIOS-1)? "AMARELO": "VERMELHO";
+            const char *cor_txt = (usuarios_ativos==0)          ? "AZUL"    :
+                                  (usuarios_ativos<=MAX_USUARIOS-2)? "VERDE"   :
+                                  (usuarios_ativos==MAX_USUARIOS-1)? "AMARELO" : "VERMELHO";
             sprintf(buf[2], "LED: %s", cor_txt);
             sprintf(buf[3], "Resets: %ld", total_resets);
 
@@ -169,7 +178,7 @@ static void task_entrada(void *arg)
 {
     bool estado_ant = true;
 
-    while (true) {
+    while (1) {
         bool estado_atual = gpio_get(PINO_BTN_ENTRADA);
 
         if (estado_ant && !estado_atual) {
@@ -184,10 +193,10 @@ static void task_entrada(void *arg)
                     comando_display_t cmd = CMD_ATUALIZAR_TELA;
                     xQueueSendToBack(fila_display, &cmd, 0);
                 } else {
-                    /* ----- Beep curto: sistema lotado --------------------- */
-                    gpio_put(PINO_BUZZER, 1);
+                    /* Beep curto – sistema lotado */
+                    buzzer_on();
                     vTaskDelay(pdMS_TO_TICKS(100));
-                    gpio_put(PINO_BUZZER, 0);
+                    buzzer_off();
                 }
 
                 while (!gpio_get(PINO_BTN_ENTRADA))
@@ -204,7 +213,7 @@ static void task_saida(void *arg)
 {
     bool estado_ant = true;
 
-    while (true) {
+    while (1) {
         bool estado_atual = gpio_get(PINO_BTN_SAIDA);
 
         if (estado_ant && !estado_atual) {
@@ -238,7 +247,7 @@ static void task_reset(void *arg)
     comando_display_t cmd_show  = CMD_MOSTRAR_MSG_RESET;
     comando_display_t cmd_clear = CMD_OCULTAR_MSG_RESET;
 
-    while (true) {
+    while (1) {
         if (xSemaphoreTake(sem_reset_irq, portMAX_DELAY) == pdTRUE) {
             xSemaphoreTake(mtx_usuarios, portMAX_DELAY);
 
@@ -248,11 +257,11 @@ static void task_reset(void *arg)
 
             xSemaphoreGive(mtx_usuarios);
 
-            /* ----- Beep duplo -------------------------------------------- */
+            /* Beep duplo */
             for (uint8_t i = 0; i < 2; ++i) {
-                gpio_put(PINO_BUZZER, 1);
+                buzzer_on();
                 vTaskDelay(pdMS_TO_TICKS(100));
-                gpio_put(PINO_BUZZER, 0);
+                buzzer_off();
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
 
@@ -267,7 +276,7 @@ static void task_reset(void *arg)
 static void task_alternar_tela(void *arg)
 {
     comando_display_t cmd = CMD_ALTERNAR_TELA;
-    while (true) {
+    while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         xQueueSendToBack(fila_display, &cmd, 0);
     }
@@ -278,7 +287,7 @@ static void task_display(void *arg)
 {
     comando_display_t cmd;
 
-    while (true) {
+    while (1) {
         if (xQueueReceive(fila_display, &cmd, portMAX_DELAY) == pdPASS) {
             switch (cmd) {
                 case CMD_ATUALIZAR_TELA:        desenhar_tela(); break;
@@ -314,9 +323,16 @@ int main(void)
     gpio_init(PINO_LED_AZUL);     gpio_set_dir(PINO_LED_AZUL,  GPIO_OUT);
     gpio_init(PINO_LED_VERMELHO); gpio_set_dir(PINO_LED_VERMELHO, GPIO_OUT);
 
-    /* Buzzer */
-    gpio_init(PINO_BUZZER);       gpio_set_dir(PINO_BUZZER, GPIO_OUT);
-    gpio_put(PINO_BUZZER, 0);
+    /* Buzzer PWM */
+    gpio_set_function(PINO_BUZZER, GPIO_FUNC_PWM);
+    slice_buzzer   = pwm_gpio_to_slice_num(PINO_BUZZER);
+    channel_buzzer = pwm_gpio_to_channel(PINO_BUZZER);
+
+    pwm_set_clkdiv(slice_buzzer, 125.0f);                 // 125 MHz / 125 = 1 MHz
+    uint32_t wrap = (1000000 / PWM_FREQUENCIA_BUZZER) - 1;/* 1 MHz base */
+    pwm_set_wrap(slice_buzzer, wrap);
+    pwm_set_chan_level(slice_buzzer, channel_buzzer, wrap / 2); /* 50 % duty */
+    pwm_set_enabled(slice_buzzer, false);                 /* inicia desligado */
 
     /* Botões / Joystick */
     gpio_init(PINO_BTN_ENTRADA);  gpio_set_dir(PINO_BTN_ENTRADA, GPIO_IN); gpio_pull_up(PINO_BTN_ENTRADA);
@@ -346,5 +362,5 @@ int main(void)
     xTaskCreate(task_display,        "Display",      1024, NULL, 2, NULL);
 
     vTaskStartScheduler();
-    while (true);   /* nunca deve chegar aqui */
+    while (1);   /* nunca deve chegar aqui */
 }
