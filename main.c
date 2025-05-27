@@ -138,12 +138,13 @@ static void desenhar_tela(void)
 
     /* ----- Feedback LED RGB ------------------------------------------------- */
     bool azul     = (usuarios_ativos == 0);
-    bool verde    = (usuarios_ativos > 0 && usuarios_ativos <= MAX_USUARIOS-1);
-    bool vermelho = (usuarios_ativos == MAX_USUARIOS);
+    bool verde    = (usuarios_ativos > 0 && usuarios_ativos <= MAX_USUARIOS-2);  // 1-8: só verde
+    bool amarelo  = (usuarios_ativos == MAX_USUARIOS-1);                         // 9: verde + vermelho
+    bool vermelho_puro = (usuarios_ativos == MAX_USUARIOS);                      // 10: só vermelho
 
     gpio_put(PINO_LED_AZUL,     azul);
-    gpio_put(PINO_LED_VERDE,    verde);
-    gpio_put(PINO_LED_VERMELHO, vermelho);
+    gpio_put(PINO_LED_VERDE,    verde || amarelo);        // Verde ligado em 1-8 e 9
+    gpio_put(PINO_LED_VERMELHO, amarelo || vermelho_puro); // Vermelho ligado em 9 e 10
 
     /* ----- Feedback matriz 5×5 --------------------------------------------- */
     if (usuarios_ativos == MAX_USUARIOS)

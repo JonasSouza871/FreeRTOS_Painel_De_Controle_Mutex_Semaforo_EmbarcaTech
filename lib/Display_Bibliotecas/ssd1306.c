@@ -148,6 +148,10 @@ void ssd1306_draw_char(ssd1306_t *ssd, char c, uint8_t x, uint8_t y, bool use_sm
         index = 70 * 8;
         rotate = true;
     } 
+    else if (c == '/') {
+        index = 71 * 8;
+        rotate = true;
+    } 
     else {
         return; // Caractere não suportado
     }
